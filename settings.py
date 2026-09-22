@@ -1,4 +1,4 @@
-from typing import Dict, Any, Protocol
+from typing import Dict, Any, List, Tuple, Protocol
 from pydantic import BaseModel
 
 from cat import plugin
@@ -7,7 +7,6 @@ from cat.services.string_crypto import StringCrypto
 
 #: settings encrypted at rest: every field whose key contains "_secret"
 SECRET_SETTINGS = ("mistral_api_key")
-
 
 # Plugin settings
 class PluginSettings(BaseModel):
@@ -69,7 +68,7 @@ def _decrypted(stored: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
 async def load_settings(plugin_id: str, agent_id: str) -> Dict[str, Any]:
     stored = await crud_plugins.get_setting(agent_id, plugin_id)
     if stored is None:
-        return ConnectorsSettings().model_dump()
+        return PluginSettings().model_dump()
     return _decrypted(stored, agent_id)
 
 
