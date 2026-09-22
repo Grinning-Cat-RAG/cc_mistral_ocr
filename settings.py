@@ -1,6 +1,8 @@
 from typing import Dict, Any, Protocol
 from pydantic import BaseModel
+
 from cat import plugin
+from cat.db.cruds import plugins as crud_plugins
 from cat.services.string_crypto import StringCrypto
 
 #: settings encrypted at rest: every field whose key contains "_secret"
