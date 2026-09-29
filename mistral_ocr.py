@@ -1,4 +1,6 @@
-from pathlib import Path
+import re
+from io import BytesIO
+from pathlib import PurePosixPath
 
 from cat.auth.connection import AuthorizedInfo
 from cat.exceptions import CustomValidationException
@@ -8,9 +10,38 @@ from cat import endpoint, check_permissions, AuthPermission, AuthResource
 from pydantic import BaseModel
 import json
 import base64
-import requests
-import os
-import tempfile
+import httpx
+
+# the OCR of a long PDF takes a while, but a request never waits for Mistral longer than this
+TIMEOUT_SECONDS = 120.0
+
+
+def _client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=TIMEOUT_SECONDS)
+
+
+def _document_name(filename: str) -> str:
+    """The name of a document chosen by the user, reduced to a plain name (no folders, no extension, only letters,
+    digits, ``_`` and ``-``): it only names the pages ingested, never a path."""
+    name = PurePosixPath(filename.replace("\\", "/")).name
+    name = re.sub(r"\.pdf$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"[^\w-]+", "_", name).strip("_")[:80]
+    return name or "document"
+
+
+async def _ingest_pages(info: AuthorizedInfo, pages: list, name, tags: List["Tag"]) -> None:
+    """Ingest every page (its markdown) in the memory of the agent, from memory: nothing is written on the disk of the
+    instance, shared by every agent. ``name(i)`` is the name of the i-th page."""
+    metadata = {item.name: item.value for item in tags}
+    for i, page in enumerate(pages):
+        content = page.get("markdown", "").encode("utf-8")
+        await info.lizard.rabbit_hole.ingest_file(
+            cat=info.cheshire_cat,
+            file=BytesIO(content),
+            filename=name(i),
+            metadata=metadata,
+            content_type="text/markdown",
+        )
 
 
 class Tag(BaseModel):
@@ -34,7 +65,7 @@ class OCRPDFInput(BaseModel):
 async def ocr(
     ocr_input: OCRInput,
     info: AuthorizedInfo = check_permissions(AuthResource.MEMORY, AuthPermission.DELETE),
-) -> str:
+) -> dict:
     settings = await info.cheshire_cat.mad_hatter.get_plugin().load_settings()
     api_key = settings["mistral_api_key"]
     save_rh = settings["save_text_to_rabbit_hole"]
@@ -56,25 +87,18 @@ async def ocr(
 
     response = None
     try:
-        response = requests.post(api_url, headers=headers, json=data)
+        async with _client() as client:
+            response = await client.post(api_url, headers=headers, json=data)
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
         ocr_response = response.json()
 
         log.debug(f"OCR response: {ocr_response}")
 
         if save_rh:
-            for page in ocr_response.get("pages", []):  # Added .get to handle case where pages doesn't exist
-                # Nome del file di output
-                output_file = "ocrpage.md"
-                markdown_content = page.get("markdown", "")  # Access markdown safely
-                Path(output_file).write_text(markdown_content, encoding="utf-8")
-
-                metadata = {item.name: item.value for item in ocr_input.tags}
-                await info.lizard.rabbit_hole.ingest_file(cat=info.cheshire_cat, file=output_file, metadata=metadata)
-                os.remove(output_file)
+            await _ingest_pages(info, ocr_response.get("pages", []), lambda i: "ocrpage.md", ocr_input.tags)
 
         return ocr_response
-    except requests.exceptions.RequestException as e:
+    except httpx.HTTPError as e:
         log.debug(f"Error during OCR request: {e}")
         raise e
     except json.JSONDecodeError as e:
@@ -92,18 +116,14 @@ async def ocr(
 async def ocr_pdf(
     ocr_input: OCRPDFInput,
     info: AuthorizedInfo = check_permissions(AuthResource.MEMORY, AuthPermission.DELETE),
-) -> str:
-    original_filename = ocr_input.filename
+) -> dict:
+    name = _document_name(ocr_input.filename)
     settings = await info.cheshire_cat.mad_hatter.get_plugin().load_settings()
     api_key = settings["mistral_api_key"]
     save_rh = settings["save_text_to_rabbit_hole"]
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
-        temp_pdf_path = temp_pdf.name
-        content = base64.b64decode(ocr_input.pdf)
-        temp_pdf.write(content)
-    try:
-        document_url = upload_pdf(api_key, temp_pdf_path)
+    async with _client() as client:
+        document_url = await upload_pdf(client, api_key, f"{name}.pdf", base64.b64decode(ocr_input.pdf))
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -113,32 +133,23 @@ async def ocr_pdf(
             "document": {"type": "document_url", "document_url": document_url},
             "include_image_base64": True,
         }
-        response = requests.post(
+        response = await client.post(
             "https://api.mistral.ai/v1/ocr", headers=headers, json=payload,
         )
-        response.raise_for_status()
-        ocr_response = response.json()
-        log.debug(f"OCR PDF response: {ocr_response}")
+    response.raise_for_status()
+    ocr_response = response.json()
+    log.debug(f"OCR PDF response: {ocr_response}")
 
-        if save_rh:
-            for i, page in enumerate(ocr_response.get("pages", [])):
-                output_file = f"{original_filename}_{i}.md"
-                Path(output_file).write_text(page.get("markdown", ""), encoding="utf-8")
-
-                metadata = {item.name: item.value for item in ocr_input.tags}
-                await info.lizard.rabbit_hole.ingest_file(cat=info.cheshire_cat, file=output_file, metadata=metadata)
-                os.remove(output_file)
-        return ocr_response
-    finally:
-        if os.path.exists(temp_pdf_path):
-            os.remove(temp_pdf_path)
+    if save_rh:
+        await _ingest_pages(info, ocr_response.get("pages", []), lambda i: f"{name}_{i}.md", ocr_input.tags)
+    return ocr_response
 
 
-def upload_pdf(api_key: str, filename: str) -> str:
-    files = {"file": (Path(filename).name, Path(filename).read_bytes())}
+async def upload_pdf(client: httpx.AsyncClient, api_key: str, filename: str, content: bytes) -> str:
+    files = {"file": (filename, content)}
     data = {"purpose": "ocr"}
     headers = {"Authorization": f"Bearer {api_key}"}
-    response = requests.post(
+    response = await client.post(
         "https://api.mistral.ai/v1/files", headers=headers, files=files, data=data,
     )
     response.raise_for_status()
@@ -146,7 +157,7 @@ def upload_pdf(api_key: str, filename: str) -> str:
     file_id = uploaded["id"]
 
     # signed URL
-    response = requests.get(
+    response = await client.get(
         f"https://api.mistral.ai/v1/files/{file_id}/url?expiry=24", headers=headers,
     )
     response.raise_for_status()
