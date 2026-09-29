@@ -6,7 +6,7 @@ from cat.db.cruds import plugins as crud_plugins
 from cat.services.string_crypto import StringCrypto
 
 #: settings encrypted at rest: every field whose key contains "_secret"
-SECRET_SETTINGS = ("mistral_api_key")
+SECRET_SETTINGS = ("mistral_api_key",)
 
 # Plugin settings
 class PluginSettings(BaseModel):
